@@ -86,6 +86,8 @@ function summary(p) {
     age: p.age,
     ovr: ovr(p),
     dev: DEV[p.devTrait] ?? p.devTrait,
+    ...(p.isOnPracticeSquad ? { practiceSquad: true } : {}),
+    ...(p.isOnIR ? { injuredReserve: true } : {}),
     rosterId: p.rosterId,
   };
 }
@@ -197,7 +199,14 @@ function buildServer() {
       let list = [...players.values()].filter((p) => !p._freeAgent && p.teamId === t.teamId);
       if (position) list = list.filter((p) => norm(p.position) === norm(position));
       list.sort((a, b) => String(a.position).localeCompare(String(b.position)) || (ovr(b) ?? 0) - (ovr(a) ?? 0));
-      return out({ team: t.displayName || t.nickName || t.abbrName, count: list.length, players: list.map(summary) });
+      const ps = list.filter((p) => p.isOnPracticeSquad).length;
+      return out({
+        team: t.displayName || t.nickName || t.abbrName,
+        count: list.length,
+        activeRoster: list.length - ps,
+        practiceSquad: ps,
+        players: list.map(summary),
+      });
     }
   );
 
