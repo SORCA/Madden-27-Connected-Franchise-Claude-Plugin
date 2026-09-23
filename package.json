@@ -1,6 +1,6 @@
 {
   "name": "madden-franchise-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Receives Madden Companion App exports and serves the league data to Claude as an MCP connector",
   "type": "module",
   "main": "server.js",
