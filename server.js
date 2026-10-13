@@ -10,7 +10,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.SECRET_KEY;
 const DATA_DIR = process.env.DATA_DIR || "./data";
@@ -284,6 +284,55 @@ function aggregateStats(rows) {
   return totals;
 }
 
+// ---------------- contracts ----------------
+// Companion App money fields: capHit / capReleasePenalty / capReleaseNetSavings are in $10,000 units
+// (capHit 1000 = $10.0M per year); contractSalary / contractBonus are full-contract dollar totals.
+const capM = (v) => (typeof v === "number" ? Math.round(v) / 100 : null); // -> $ millions
+const dollarsM = (v) => (typeof v === "number" ? Math.round(v / 10000) / 100 : null);
+
+function contractRow(p) {
+  return {
+    ...summary(p),
+    capHitM: capM(p.capHit),
+    yearsLeft: p.contractYearsLeft ?? null,
+    length: p.contractLength ?? null,
+    totalSalaryM: dollarsM(p.contractSalary),
+    totalBonusM: dollarsM(p.contractBonus),
+    remainingCapM: p.capHit != null && p.contractYearsLeft != null ? capM(p.capHit * p.contractYearsLeft) : null,
+    deadCapIfCutM: capM(p.capReleasePenalty),
+    savingsIfCutM: dollarsM(p.capReleaseNetSavings),
+  };
+}
+
+// "Market" cap hit for an OVR = median cap hit of rostered (non-FA) players at that OVR.
+// Overpay = player's cap hit minus that median. Buckets with few players borrow from neighbours.
+function marketByOvr(pool) {
+  const by = new Map();
+  for (const p of pool) {
+    const o = ovr(p);
+    if (o == null || typeof p.capHit !== "number") continue;
+    if (!by.has(o)) by.set(o, []);
+    by.get(o).push(p.capHit);
+  }
+  const median = (a) => {
+    const s = [...a].sort((x, y) => x - y);
+    const m = Math.floor(s.length / 2);
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  };
+  const cache = new Map();
+  return (o) => {
+    if (cache.has(o)) return cache.get(o);
+    let vals = [];
+    for (let w = 0; w <= 5 && vals.length < 8; w++) {
+      vals = [];
+      for (let k = o - w; k <= o + w; k++) vals.push(...(by.get(k) ?? []));
+    }
+    const v = vals.length ? median(vals) : null;
+    cache.set(o, v);
+    return v;
+  };
+}
+
 const latestSeason = () =>
   Math.max(-1, ...playerStats.map((s) => s.seasonIndex ?? -1), ...games.map((g) => g.seasonIndex ?? -1));
 
@@ -484,6 +533,65 @@ function buildServer() {
           askingSalary: p.desiredSalary,
           askingBonus: p.desiredBonus,
           askingYears: p.desiredLength,
+        })),
+      });
+    }
+  );
+
+  server.registerTool(
+    "get_contracts",
+    {
+      description:
+        "League-wide contract list for rostered players, with cap hit, years left, full-contract totals, dead cap if cut and savings if cut (all in $ millions). " +
+        "sort_by: 'overpay' (default; cap hit above the median cap hit of players at the same OVR, i.e. worst-value deals first), " +
+        "'cap_hit', 'remaining' (cap hit x years left), 'dead_cap', 'total_value', or 'value' (cheapest for their OVR first). " +
+        "Filter by team, position/group, age, OVR and minimum years left.",
+      inputSchema: {
+        sort_by: z.enum(["overpay", "cap_hit", "remaining", "dead_cap", "total_value", "value"]).optional(),
+        team: z.string().optional().describe("Limit to one team"),
+        position: z.string().optional().describe("Position or group, e.g. 'QB', 'OL', 'EDGE'"),
+        min_ovr: z.number().optional(),
+        min_age: z.number().optional(),
+        max_age: z.number().optional(),
+        min_years_left: z.number().int().optional(),
+        limit: z.number().int().min(1).max(100).optional(),
+      },
+      annotations: RO,
+    },
+    async ({ sort_by = "overpay", team, position, min_ovr, min_age, max_age, min_years_left, limit = 25 }) => {
+      if (!players.size) return noData();
+      const rostered = [...players.values()].filter((p) => !p._freeAgent && typeof p.capHit === "number");
+      if (!rostered.length) return out({ message: "No contract data in the roster export." });
+      const market = marketByOvr(rostered);
+      let list = rostered.filter(positionMatcher(position));
+      if (team) {
+        const t = findTeam(team);
+        if (!t) return needTeams(team);
+        list = list.filter((p) => p.teamId === t.teamId);
+      }
+      if (min_ovr != null) list = list.filter((p) => (ovr(p) ?? 0) >= min_ovr);
+      if (min_age != null) list = list.filter((p) => (p.age ?? 0) >= min_age);
+      if (max_age != null) list = list.filter((p) => (p.age ?? 99) <= max_age);
+      if (min_years_left != null) list = list.filter((p) => (p.contractYearsLeft ?? 0) >= min_years_left);
+
+      const overpay = (p) => p.capHit - (market(ovr(p)) ?? p.capHit);
+      const sorters = {
+        overpay: (p) => overpay(p),
+        cap_hit: (p) => p.capHit,
+        remaining: (p) => p.capHit * (p.contractYearsLeft ?? 0),
+        dead_cap: (p) => p.capReleasePenalty ?? 0,
+        total_value: (p) => (p.contractSalary ?? 0) + (p.contractBonus ?? 0),
+        value: (p) => -overpay(p),
+      };
+      list.sort((a, b) => sorters[sort_by](b) - sorters[sort_by](a) || (ovr(b) ?? 0) - (ovr(a) ?? 0));
+      return out({
+        matches: list.length,
+        sortedBy: sort_by,
+        note: "capHit/deadCap/savings come from capHit units of $10k; totals are full-contract dollars. Overpay = cap hit minus the league median cap hit at the same OVR.",
+        players: list.slice(0, limit).map((p) => ({
+          ...contractRow(p),
+          marketCapHitM: capM(market(ovr(p))),
+          overpayM: capM(overpay(p)),
         })),
       });
     }

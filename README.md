@@ -34,6 +34,7 @@ Claude → Settings → Connectors → Add custom connector → URL:
 - `get_team_roster`: roster with Active / Practice Squad / IR status and counts; filter by position group or status
 - `find_players`: league-wide filters (position group, age, OVR, dev, status) sorted by OVR, age or any rating
 - `get_free_agents`: best available, with asking contract
+- `get_contracts`: league-wide contracts (cap hit, years left, dead cap, savings if cut); sort by worst value (overpay vs. players at the same OVR), cap hit, remaining money, dead cap, total value, or best value
 - `get_player_stats`: season totals from weekly stat exports
 - `get_standings`, `get_schedule`
 - `data_status`: server version and when each kind of data was last exported
