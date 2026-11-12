@@ -42,6 +42,13 @@ Optional variables:
 - `DEFAULT_LEAGUE` = the league ID (or name) the plain `/mcp/YOUR_SECRET_KEY` URL should read.
   If unset: the only league, or with several, the league that has been on the server the longest.
 
+## Season history
+Weekly stats, schedules, team stats and standings are stored per season, so starting a new season never
+overwrites the last one. Ask about any past season by year (e.g. 2026) or seasonIndex (0 = first season).
+Only weeks that were exported are counted, so export every week (Snallabot Auto Update does this).
+Playoff weeks are those after the regular season (`REG_SEASON_WEEKS`, default 18).
+Recorded accolades are kept in `DATA_DIR/accolades/`.
+
 ## Tools
 - `search_players`: find anyone by name
 - `get_player`: full ratings, contract, status, injury, bio, traits
@@ -51,7 +58,12 @@ Optional variables:
 - `get_free_agents`: best available, with asking contract
 - `get_contracts`: league-wide contracts (cap hit, years left, dead cap, savings if cut); sort by worst value (overpay vs. players at the same OVR), cap hit, remaining money, dead cap, total value, or best value
 - `get_player_stats`: season totals from weekly stat exports
-- `get_standings`, `get_schedule`
+- `get_standings`, `get_schedule`: current or any past season
+- `list_seasons`: which seasons are saved, with calendar years
+- `get_season_leaders`: league leaders for any season/stat (regular season, playoffs or both), optionally by team or position
+- `get_team_season`: a team's record, ranks, every result, team stats and stat leaders for any season
+- `get_accolades`: recorded awards plus automatic statistical titles for a season
+- `record_accolade` / `remove_accolade`: save awards the league hands out (MVP, OPOY, Super Bowl champ, All-Pro, records, milestones)
 - `data_status`: which league the connector reads, every league on the server, server version, and when each kind of data was last exported
 
 Position groups: OL, OT, OG, IOL, EDGE/DE, DL, LB, OLB, MLB, S, DB, RB, ST.

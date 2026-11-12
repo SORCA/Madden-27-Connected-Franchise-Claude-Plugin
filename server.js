@@ -12,7 +12,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-const VERSION = "2.2.0";
+const VERSION = "2.3.0";
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.SECRET_KEY;
 const DATA_DIR = process.env.DATA_DIR || "./data";
@@ -49,11 +49,13 @@ const POSITION_GROUPS = {
 
 // ---------------- storage ----------------
 // Every export is saved as one JSON file per export path (a re-export of the
-// same path replaces the old file). The Companion App puts the league ID in
+// same path replaces the old file). Weekly stats/schedules and standings are
+// saved per season as well, so a new season's week 1 never overwrites last
+// season's week 1: past seasons stay available. The Companion App puts the league ID in
 // every export path (/<platform>/<leagueId>/...), so several leagues can export
 // to the same URL: each league's data is indexed separately and never mixed.
 
-const docs = new Map(); // exportPath -> { path, receivedAt, body }  (all leagues)
+const docs = new Map(); // storage key -> { key, path, season, receivedAt, body }  (all leagues)
 const leagues = new Map(); // leagueId -> indexed data for that league
 
 function leagueOf(exportPath) {
@@ -62,8 +64,25 @@ function leagueOf(exportPath) {
 }
 
 const emptyState = (id) => ({
-  id, docs: [], players: new Map(), teams: [], standings: [], games: [], playerStats: [], listKeysSeen: new Set(),
+  id, docs: [], players: new Map(), teams: [], standings: [], standingsBySeason: new Map(), games: [],
+  playerStats: [], teamStats: [], listKeysSeen: new Set(),
 });
+
+// First seasonIndex found in any list of an export body (stats, schedules and standings carry one)
+function seasonOfBody(body) {
+  if (!body || typeof body !== "object") return null;
+  for (const v of Object.values(body)) {
+    if (!Array.isArray(v)) continue;
+    const row = v.find((r) => r && typeof r.seasonIndex === "number");
+    if (row) return row.seasonIndex;
+  }
+  return null;
+}
+
+// Weekly stats, schedules and standings are kept per season; everything else is one copy per path.
+function storageKey(exportPath, season) {
+  return season != null && /\/week\/|standings/i.test(exportPath) ? `${exportPath}#season${season}` : exportPath;
+}
 
 function fileFor(exportPath) {
   const safe = exportPath.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
@@ -75,7 +94,7 @@ function loadFromDisk() {
     if (!f.endsWith(".json")) continue;
     try {
       const doc = JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), "utf8"));
-      if (doc && doc.path) docs.set(doc.path, doc);
+      if (doc && doc.path) docs.set(doc.key ?? doc.path, doc);
     } catch (err) {
       console.warn(`Skipping unreadable file ${f}: ${err.message}`);
     }
@@ -83,11 +102,11 @@ function loadFromDisk() {
 }
 
 function saveDoc(doc) {
-  const file = fileFor(doc.path);
+  const file = fileFor(doc.key ?? doc.path);
   const tmp = `${file}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(doc));
   fs.renameSync(tmp, file); // atomic, so a crash can't leave a half-written file
-  docs.set(doc.path, doc);
+  docs.set(doc.key ?? doc.path, doc);
 }
 
 const statCategory = (listKey) =>
@@ -101,6 +120,8 @@ function rebuild(leagueId) {
   const nextPlayers = new Map();
   const nextGames = new Map();
   const nextStats = [];
+  const nextTeamStats = [];
+  const standingsBySeason = new Map(); // seasonIndex -> latest standings rows for that season
   const keys = new Set();
   let nextTeams = [];
   let nextStandings = [];
@@ -119,7 +140,11 @@ function rebuild(leagueId) {
       }
     }
     if (Array.isArray(body.leagueTeamInfoList)) nextTeams = body.leagueTeamInfoList;
-    if (Array.isArray(body.teamStandingInfoList)) nextStandings = body.teamStandingInfoList;
+    if (Array.isArray(body.teamStandingInfoList)) {
+      nextStandings = body.teamStandingInfoList;
+      const season = doc.season ?? seasonOfBody(body);
+      if (season != null) standingsBySeason.set(season, body.teamStandingInfoList);
+    }
     if (Array.isArray(body.gameScheduleInfoList)) {
       for (const g of body.gameScheduleInfoList) {
         const id = g.scheduleId ?? `${g.seasonIndex}-${g.weekIndex}-${g.homeTeamId}-${g.awayTeamId}`;
@@ -140,11 +165,29 @@ function rebuild(leagueId) {
         });
       }
     }
+    for (const [k, v] of Object.entries(body)) {
+      if (!/^team.*StatInfoList$/.test(k) || !Array.isArray(v)) continue;
+      for (const row of v) {
+        if (row?.teamId == null) continue;
+        nextTeamStats.push({
+          teamId: row.teamId,
+          stage: stageFromPath(doc.path),
+          seasonIndex: row.seasonIndex ?? null,
+          weekIndex: row.weekIndex ?? null,
+          row,
+        });
+      }
+    }
   }
 
   // A weekly stat export replaces the same week's file, but guard against duplicates anyway
   const dedup = new Map();
   for (const s of nextStats) dedup.set(`${s.rosterId}|${s.category}|${s.stage}|${s.seasonIndex}|${s.weekIndex}`, s);
+  const teamDedup = new Map();
+  for (const s of nextTeamStats) teamDedup.set(`${s.teamId}|${s.stage}|${s.seasonIndex}|${s.weekIndex}`, s);
+  // Current standings = the newest season's standings
+  const newestStandingsSeason = Math.max(-1, ...standingsBySeason.keys());
+  if (newestStandingsSeason >= 0) nextStandings = standingsBySeason.get(newestStandingsSeason);
 
   leagues.set(leagueId, {
     id: leagueId,
@@ -152,8 +195,10 @@ function rebuild(leagueId) {
     players: nextPlayers,
     teams: nextTeams,
     standings: nextStandings,
+    standingsBySeason,
     games: [...nextGames.values()],
     playerStats: [...dedup.values()],
+    teamStats: [...teamDedup.values()],
     listKeysSeen: keys,
   });
 }
@@ -194,11 +239,34 @@ const leagueList = () =>
 loadFromDisk();
 rebuildAll();
 
+// ---------------- accolades (awards the league hands out, recorded through Claude) ----------------
+// Kept in DATA_DIR/accolades/<leagueId>.json, separate from the export files.
+
+const ACCOLADE_DIR = path.join(DATA_DIR, "accolades");
+fs.mkdirSync(ACCOLADE_DIR, { recursive: true });
+const accoladeFile = (leagueId) => path.join(ACCOLADE_DIR, `${String(leagueId).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+function readAccolades(leagueId) {
+  try {
+    const list = JSON.parse(fs.readFileSync(accoladeFile(leagueId), "utf8"));
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+function writeAccolades(leagueId, list) {
+  const file = accoladeFile(leagueId);
+  fs.writeFileSync(`${file}.tmp`, JSON.stringify(list, null, 1));
+  fs.renameSync(`${file}.tmp`, file);
+}
+
+// Regular-season weeks are weekIndex 0..REG_SEASON_WEEKS-1; later weeks are playoffs.
+const REG_SEASON_WEEKS = Number(process.env.REG_SEASON_WEEKS) || 18;
+
 // ---------------- MCP server (one per request, bound to one league) ----------------
 
 function buildServer(leagueId) {
   const L = leagues.get(leagueId) ?? emptyState(leagueId);
-  const { players, teams, standings, games, playerStats, listKeysSeen } = L;
+  const { players, teams, standings, standingsBySeason, games, playerStats, teamStats, listKeysSeen } = L;
   const docs = L.docs; // this league's exports only
 
   // ---------------- helpers ----------------
@@ -211,6 +279,7 @@ function buildServer(leagueId) {
   const teamNameById = (id) => teamName(teamById(id)) ?? String(id ?? "?");
 
   function rosterStatus(p) {
+    if (p._historical) return "Not on a current roster";
     if (p._freeAgent) return "Free Agent";
     if (p.isOnIR) return "IR";
     if (p.isOnPracticeSquad) return "Practice Squad";
@@ -386,7 +455,153 @@ function buildServer(leagueId) {
   }
 
   const latestSeason = () =>
-    Math.max(-1, ...playerStats.map((s) => s.seasonIndex ?? -1), ...games.map((g) => g.seasonIndex ?? -1));
+    Math.max(-1, ...playerStats.map((s) => s.seasonIndex ?? -1), ...games.map((g) => g.seasonIndex ?? -1), ...standingsBySeason.keys());
+
+  // ---------------- seasons / history ----------------
+
+  // calendarYear - seasonIndex, from any standings row (e.g. seasonIndex 1 = 2027 -> offset 2026)
+  const yearOffset = (() => {
+    for (const [s, rows] of standingsBySeason) {
+      const r = rows.find((x) => typeof x.calendarYear === "number");
+      if (r) return r.calendarYear - (r.seasonIndex ?? s);
+    }
+    const r = standings.find((x) => typeof x.calendarYear === "number" && typeof x.seasonIndex === "number");
+    return r ? r.calendarYear - r.seasonIndex : null;
+  })();
+  const yearFor = (s) => (yearOffset == null || s == null ? null : yearOffset + s);
+  // Accepts a seasonIndex (0 = first season) or a calendar year (e.g. 2026); defaults to the latest season
+  const toSeason = (v) => (v == null ? latestSeason() : v >= 1900 && yearOffset != null ? v - yearOffset : v);
+  const SEASON_ARG = z.number().int().optional().describe("seasonIndex (0 = first season) or calendar year like 2026; defaults to the latest season");
+  const PHASE_ARG = z.enum(["regular", "playoffs", "all"]).optional().describe("regular season (default), playoffs, or both");
+  const phaseOf = (weekIndex) => ((weekIndex ?? 0) < REG_SEASON_WEEKS ? "regular" : "playoffs");
+  const inPhase = (weekIndex, phase) => phase === "all" || phaseOf(weekIndex) === phase;
+
+  function seasonsAvailable() {
+    const all = new Set([
+      ...playerStats.map((x) => x.seasonIndex),
+      ...games.map((g) => g.seasonIndex),
+      ...standingsBySeason.keys(),
+    ].filter((x) => typeof x === "number"));
+    return [...all].sort((a, b) => a - b).map((s) => ({
+      seasonIndex: s,
+      year: yearFor(s),
+      statWeeksExported: new Set(playerStats.filter((x) => x.seasonIndex === s && x.stage === "regular").map((x) => x.weekIndex)).size,
+      gamesInSchedule: games.filter((g) => g.seasonIndex === s && g._stage === "regular").length,
+      standings: standingsBySeason.has(s),
+    }));
+  }
+
+  // Players found only in stat lines (retired / no longer on any exported roster)
+  function statPlayers(query) {
+    const raw = String(query).trim();
+    const q = norm(raw);
+    const seen = new Map();
+    for (const x of playerStats) if (!seen.has(x.rosterId)) seen.set(x.rosterId, x.row);
+    const hits = [];
+    for (const [id, row] of seen) {
+      if (players.has(id)) continue;
+      if (id === raw || (q && norm(row.fullName).includes(q)))
+        hits.push({ firstName: "", lastName: row.fullName ?? id, rosterId: id, teamId: row.teamId, _historical: true });
+    }
+    return hits;
+  }
+  const lookupPlayers = (q) => {
+    const hits = findPlayers(q);
+    return hits.length ? hits : statPlayers(q);
+  };
+
+  // Season totals per player for one stat category
+  function seasonTotals(category, season, phase = "regular") {
+    const by = new Map();
+    for (const x of playerStats) {
+      if (x.category !== category || x.stage !== "regular" || x.seasonIndex !== season || !inPhase(x.weekIndex, phase)) continue;
+      if (!by.has(x.rosterId)) by.set(x.rosterId, []);
+      by.get(x.rosterId).push(x);
+    }
+    return [...by].map(([rosterId, rows]) => ({
+      rosterId,
+      rows,
+      games: rows.length,
+      totals: aggregateStats(rows),
+      teamIds: [...new Set(rows.map((r) => r.row.teamId))],
+    }));
+  }
+  function whoIs(rosterId, rows) {
+    const p = players.get(String(rosterId));
+    return p
+      ? { name: fullName(p), pos: p.position, currentTeam: p._freeAgent ? "Free Agent" : teamNameById(p.teamId), rosterId: p.rosterId }
+      : { name: rows[0]?.row.fullName ?? String(rosterId), pos: null, currentTeam: "Not on a current roster", rosterId };
+  }
+  const DEFAULT_STAT = { passing: "passYds", rushing: "rushYds", receiving: "recYds", defensive: "defSacks" };
+  function leaders(category, stat, season, { phase = "regular", teamId = null, limit = 10 } = {}) {
+    let list = seasonTotals(category, season, phase);
+    if (teamId != null) {
+      list = list
+        .map((e) => ({ ...e, rows: e.rows.filter((r) => r.row.teamId === teamId) }))
+        .filter((e) => e.rows.length)
+        .map((e) => ({ ...e, games: e.rows.length, totals: aggregateStats(e.rows), teamIds: [teamId] }));
+    }
+    const fields = [...new Set(list.flatMap((e) => Object.keys(e.totals)))].sort();
+    const key = stat ?? DEFAULT_STAT[category] ?? fields[0];
+    if (key && !fields.includes(key)) return { error: `No "${key}" in ${category} stats.`, availableStats: fields };
+    return {
+      stat: key,
+      availableStats: fields,
+      leaders: list
+        .filter((e) => typeof e.totals[key] === "number")
+        .sort((a, b) => b.totals[key] - a.totals[key])
+        .slice(0, limit)
+        .map((e, i) => ({
+          rank: i + 1,
+          ...whoIs(e.rosterId, e.rows),
+          teamsThatSeason: e.teamIds.map(teamNameById),
+          games: e.games,
+          [key]: e.totals[key],
+          totals: e.totals,
+        })),
+    };
+  }
+  const STAT_TITLES = [
+    ["passing", "passYds"], ["passing", "passTDs"],
+    ["rushing", "rushYds"], ["rushing", "rushTDs"],
+    ["receiving", "recYds"], ["receiving", "recTDs"], ["receiving", "recCatches"],
+    ["defensive", "defSacks"], ["defensive", "defInts"], ["defensive", "defTotalTackles"], ["defensive", "defForcedFum"],
+  ];
+  function statTitles(season) {
+    const out_ = [];
+    for (const [cat, stat] of STAT_TITLES) {
+      const r = leaders(cat, stat, season, { limit: 3 });
+      if (r.error || !r.leaders.length) continue;
+      const top = r.leaders[0][stat];
+      out_.push({
+        title: `${stat} leader`,
+        value: top,
+        players: r.leaders.filter((l) => l[stat] === top).map((l) => ({ name: l.name, team: l.teamsThatSeason.join(" / ") })),
+      });
+    }
+    return out_;
+  }
+
+  function scheduleFor(t, s) {
+    return games
+      .filter((g) => (g.homeTeamId === t.teamId || g.awayTeamId === t.teamId) && (g.seasonIndex == null || g.seasonIndex === s))
+      .sort((a, b) => (a._stage === b._stage ? 0 : a._stage === "preseason" ? -1 : 1) || (a.weekIndex ?? 0) - (b.weekIndex ?? 0))
+      .map((g) => {
+        const home = g.homeTeamId === t.teamId;
+        const us = home ? g.homeScore : g.awayScore;
+        const them = home ? g.awayScore : g.homeScore;
+        const played = (g.homeScore ?? 0) + (g.awayScore ?? 0) > 0;
+        return {
+          stage: g._stage === "preseason" ? "preseason" : phaseOf(g.weekIndex),
+          week: (g.weekIndex ?? 0) + 1,
+          opponent: teamNameById(home ? g.awayTeamId : g.homeTeamId),
+          homeAway: home ? "home" : "away",
+          result: played ? `${us > them ? "W" : us < them ? "L" : "T"} ${us}-${them}` : "not played",
+          status: g.status,
+        };
+      });
+  }
+  const standingsFor = (s) => standingsBySeason.get(s) ?? (s === latestSeason() ? standings : []);
 
   // ---------------- MCP tools ----------------
 
@@ -652,23 +867,24 @@ function buildServer(leagueId) {
     "get_player_stats",
     {
       description:
-        "A player's season stat totals (passing, rushing, receiving, defense, kicking, punting) from weekly stat exports, plus a week-by-week log if asked. Needs weekly stats exported from the Companion App.",
+        "A player's season stat totals (passing, rushing, receiving, defense, kicking, punting) from weekly stat exports, for the current or any past season, regular season or playoffs, plus a week-by-week log if asked. Also finds players who are no longer on any roster (retired/cut) by their stat lines.",
       inputSchema: {
         name: z.string().describe("Player name or rosterId"),
-        season: z.number().int().optional().describe("seasonIndex; defaults to the latest season in the data"),
+        season: SEASON_ARG,
+        phase: PHASE_ARG,
         include_weeks: z.boolean().optional().describe("Also return each week's line"),
       },
       annotations: RO,
     },
-    async ({ name, season, include_weeks = false }) => {
+    async ({ name, season, phase = "regular", include_weeks = false }) => {
       if (!playerStats.length) return out({ message: "No stats yet. Export weekly stats from the Companion App." });
-      const hits = findPlayers(name);
+      const hits = lookupPlayers(name);
       if (!hits.length) return out({ message: `No players match "${name}".` });
       if (hits.length > 3) return out({ message: "Several matches; be more specific or use a rosterId.", matches: hits.slice(0, 25).map(summary) });
       const p = hits[0];
-      const s = season ?? latestSeason();
+      const s = toSeason(season);
       const rows = playerStats.filter(
-        (r) => r.rosterId === String(p.rosterId) && r.stage === "regular" && (r.seasonIndex == null || r.seasonIndex === s)
+        (r) => r.rosterId === String(p.rosterId) && r.stage === "regular" && (r.seasonIndex == null || r.seasonIndex === s) && inPhase(r.weekIndex, phase)
       );
       const byCat = {};
       for (const r of rows) (byCat[r.category] ??= []).push(r);
@@ -683,7 +899,10 @@ function buildServer(leagueId) {
       return out({
         player: summary(p),
         seasonIndex: s,
-        stats: Object.keys(result).length ? result : "No regular-season stats found for this player in that season.",
+        year: yearFor(s),
+        phase,
+        teamsThatSeason: [...new Set(rows.map((r) => r.row.teamId))].map(teamNameById),
+        stats: Object.keys(result).length ? result : `No ${phase === "all" ? "" : phase + " "}stats found for this player in that season.`,
         note: "Only weeks that were exported are counted. Rates like passer rating are left out of totals.",
       });
     }
@@ -692,14 +911,20 @@ function buildServer(leagueId) {
   server.registerTool(
     "get_standings",
     {
-      description: "League standings from the League Info export, best record first. Optionally filter by team, division or conference name.",
-      inputSchema: { filter: z.string().optional().describe("Team, division or conference, e.g. 'NFC North'") },
+      description: "League standings from the League Info export, best record first, for the current or any past season. Optionally filter by team, division or conference name.",
+      inputSchema: {
+        filter: z.string().optional().describe("Team, division or conference, e.g. 'NFC North'"),
+        season: SEASON_ARG,
+      },
       annotations: RO,
     },
-    async ({ filter }) => {
-      if (!standings.length) return out({ message: "No standings yet. Export League Info from the Companion App." });
+    async ({ filter, season }) => {
+      const s = toSeason(season);
+      const base = standingsFor(s);
+      if (!base.length)
+        return out({ message: standings.length ? `No standings saved for that season.` : "No standings yet. Export League Info from the Companion App.", seasons: seasonsAvailable() });
       const f = norm(filter);
-      const rows = standings
+      const rows = base
         .map((s) => {
           const row = Object.fromEntries(Object.entries(s).filter(([, v]) => v === null || typeof v !== "object"));
           return s.teamName ? row : { teamName: teamNameById(s.teamId), ...row };
@@ -709,7 +934,7 @@ function buildServer(leagueId) {
           const pct = (r) => ((r.totalWins ?? 0) + 0.5 * (r.totalTies ?? 0)) / Math.max(1, (r.totalWins ?? 0) + (r.totalLosses ?? 0) + (r.totalTies ?? 0));
           return pct(b) - pct(a);
         });
-      return out({ teams: rows.length, standings: rows });
+      return out({ seasonIndex: s, year: yearFor(s), teams: rows.length, standings: rows });
     }
   );
 
@@ -719,7 +944,7 @@ function buildServer(leagueId) {
       description: "A team's schedule and results for a season, from the weekly schedule exports.",
       inputSchema: {
         team: z.string().describe("Team name, city, abbreviation or teamId"),
-        season: z.number().int().optional().describe("seasonIndex; defaults to the latest season in the data"),
+        season: SEASON_ARG,
       },
       annotations: RO,
     },
@@ -727,25 +952,205 @@ function buildServer(leagueId) {
       if (!games.length) return out({ message: "No schedule data yet. Export weekly schedules from the Companion App." });
       const t = findTeam(team);
       if (!t) return needTeams(team);
-      const s = season ?? latestSeason();
-      const list = games
-        .filter((g) => (g.homeTeamId === t.teamId || g.awayTeamId === t.teamId) && (g.seasonIndex == null || g.seasonIndex === s))
-        .sort((a, b) => (a._stage === b._stage ? 0 : a._stage === "preseason" ? -1 : 1) || (a.weekIndex ?? 0) - (b.weekIndex ?? 0))
-        .map((g) => {
-          const home = g.homeTeamId === t.teamId;
-          const us = home ? g.homeScore : g.awayScore;
-          const them = home ? g.awayScore : g.homeScore;
-          const played = (g.homeScore ?? 0) + (g.awayScore ?? 0) > 0;
-          return {
-            stage: g._stage,
-            week: (g.weekIndex ?? 0) + 1,
-            opponent: teamNameById(home ? g.awayTeamId : g.homeTeamId),
-            homeAway: home ? "home" : "away",
-            result: played ? `${us > them ? "W" : us < them ? "L" : "T"} ${us}-${them}` : "not played",
-            status: g.status,
-          };
-        });
-      return out({ team: teamName(t), seasonIndex: s, games: list });
+      const s = toSeason(season);
+      return out({ team: teamName(t), seasonIndex: s, year: yearFor(s), games: scheduleFor(t, s) });
+    }
+  );
+
+  server.registerTool(
+    "list_seasons",
+    {
+      description:
+        "Which seasons the server has data for (current and past), with calendar year, how many weeks of stats were exported, games in the schedule, and whether standings were saved.",
+      inputSchema: {},
+      annotations: RO,
+    },
+    async () => out({ currentSeason: latestSeason(), regularSeasonWeeks: REG_SEASON_WEEKS, seasons: seasonsAvailable() })
+  );
+
+  server.registerTool(
+    "get_season_leaders",
+    {
+      description:
+        "League leaders for any season (current or past): rank players by a season-total stat within a category, e.g. passing passYds/passTDs, rushing rushYds/rushTDs, receiving recYds/recTDs/recCatches, defensive defSacks/defInts/defTotalTackles/defDeflections/defForcedFum. Regular season by default; playoffs or both on request. Optionally only one team's players or one position group. Unknown stat names return the list of available stats.",
+      inputSchema: {
+        category: z.enum(["passing", "rushing", "receiving", "defensive", "kicking", "punting"]),
+        stat: z.string().optional().describe("Stat field to rank by; defaults to yards (sacks for defensive)"),
+        season: SEASON_ARG,
+        phase: PHASE_ARG,
+        team: z.string().optional().describe("Only stats compiled for this team that season"),
+        position: z.string().optional().describe("Position or group of the player's current position, e.g. 'WR', 'EDGE', 'DB'"),
+        limit: z.number().int().min(1).max(50).optional(),
+      },
+      annotations: RO,
+    },
+    async ({ category, stat, season, phase = "regular", team, position, limit = 10 }) => {
+      if (!playerStats.length) return out({ message: "No stats yet. Export weekly stats from the Companion App." });
+      const s = toSeason(season);
+      let teamId = null;
+      if (team) {
+        const t = findTeam(team);
+        if (!t) return needTeams(team);
+        teamId = t.teamId;
+      }
+      const r = leaders(category, stat, s, { phase, teamId, limit: position ? 500 : limit });
+      if (r.error) return out({ seasonIndex: s, year: yearFor(s), ...r });
+      let list = r.leaders;
+      if (position) {
+        const match = positionMatcher(position);
+        list = list.filter((l) => l.pos && match({ position: l.pos })).slice(0, limit).map((l, i) => ({ ...l, rank: i + 1 }));
+      }
+      return out({ seasonIndex: s, year: yearFor(s), phase, category, stat: r.stat, leaders: list, availableStats: r.availableStats });
+    }
+  );
+
+  server.registerTool(
+    "get_team_season",
+    {
+      description:
+        "One team's full season (current or past): final/latest record, standings rank, seed, points and offense/defense ranks, every game result (regular season and playoffs), team stat totals if exported, and the team's stat leaders that season.",
+      inputSchema: {
+        team: z.string().describe("Team name, city, abbreviation or teamId"),
+        season: SEASON_ARG,
+      },
+      annotations: RO,
+    },
+    async ({ team, season }) => {
+      const t = findTeam(team);
+      if (!t) return needTeams(team);
+      const s = toSeason(season);
+      const st = standingsFor(s).find((r) => r.teamId === t.teamId) ?? null;
+      const keep = [
+        "totalWins", "totalLosses", "totalTies", "winPct", "rank", "seed", "playoffStatus", "divisionName", "conferenceName",
+        "divWins", "divLosses", "confWins", "confLosses", "ptsFor", "ptsAgainst", "netPts", "ptsForRank", "ptsAgainstRank",
+        "offTotalYds", "offTotalYdsRank", "offPassYdsRank", "offRushYdsRank", "defTotalYds", "defTotalYdsRank",
+        "defPassYdsRank", "defRushYdsRank", "tODiff", "teamOvr", "weekIndex",
+      ];
+      const tRows = teamStats.filter((x) => x.teamId === t.teamId && x.stage === "regular" && x.seasonIndex === s);
+      const teamLeaders = {};
+      for (const [cat, stat] of [
+        ["passing", "passYds"], ["rushing", "rushYds"], ["receiving", "recYds"],
+        ["defensive", "defTotalTackles"], ["defensive", "defSacks"], ["defensive", "defInts"],
+      ]) {
+        const r = leaders(cat, stat, s, { phase: "regular", teamId: t.teamId, limit: 1 });
+        if (!r.error && r.leaders[0]) teamLeaders[stat] = { name: r.leaders[0].name, value: r.leaders[0][stat], games: r.leaders[0].games };
+      }
+      return out({
+        team: teamName(t),
+        seasonIndex: s,
+        year: yearFor(s),
+        record: st ? Object.fromEntries(keep.filter((k) => st[k] !== undefined).map((k) => [k, st[k]])) : "No standings saved for that season.",
+        games: scheduleFor(t, s),
+        teamStatTotals: tRows.length
+          ? { regularSeason: aggregateStats(tRows.filter((x) => phaseOf(x.weekIndex) === "regular")), weeks: tRows.length }
+          : "No team stat exports for that season.",
+        teamLeaders,
+        accolades: readAccolades(L.id).filter((a) => a.season === s && (norm(a.team) === norm(teamName(t)) || norm(a.player?.team) === norm(teamName(t)))),
+      });
+    }
+  );
+
+  server.registerTool(
+    "get_accolades",
+    {
+      description:
+        "Awards and honors: accolades the league recorded (MVP, OPOY, DPOY, ROTY, All-Pro, Super Bowl champion, etc.), filterable by season, player or team, plus automatic statistical titles (league leaders in passing/rushing/receiving yards and TDs, catches, sacks, interceptions, tackles, forced fumbles) for the chosen season.",
+      inputSchema: {
+        season: z.number().int().optional().describe("seasonIndex or calendar year; omit for every season"),
+        player: z.string().optional(),
+        team: z.string().optional(),
+        include_stat_titles: z.boolean().optional().describe("Add statistical league-leader titles (default true)"),
+      },
+      annotations: RO,
+    },
+    async ({ season, player, team, include_stat_titles = true }) => {
+      const s = season == null ? null : toSeason(season);
+      let list = readAccolades(L.id);
+      if (s != null) list = list.filter((a) => a.season === s);
+      if (player) list = list.filter((a) => norm(a.player?.name).includes(norm(player)) || String(a.player?.rosterId) === String(player).trim());
+      if (team) {
+        const t = findTeam(team);
+        const tn = norm(t ? teamName(t) : team);
+        list = list.filter((a) => norm(a.team) === tn || norm(a.player?.team) === tn);
+      }
+      list.sort((a, b) => (a.season ?? 0) - (b.season ?? 0) || String(a.award).localeCompare(String(b.award)));
+      const titlesSeason = s ?? latestSeason();
+      return out({
+        recorded: list,
+        statTitles: include_stat_titles && playerStats.length
+          ? { seasonIndex: titlesSeason, year: yearFor(titlesSeason), regularSeasonOnly: true, titles: statTitles(titlesSeason) }
+          : undefined,
+        note: list.length ? undefined : "No recorded accolades match. Use record_accolade to add awards the league gives out.",
+      });
+    }
+  );
+
+  server.registerTool(
+    "record_accolade",
+    {
+      description:
+        "Record an award or honor so it is kept with the league's history: e.g. MVP, OPOY, DPOY, OROY, DROY, Coach of the Year, All-Pro 1st Team, Pro Bowl, Super Bowl Champion, Division Champion, a broken record, or a league milestone. Give a player and/or a team. Returns the saved entry with an id (use remove_accolade with that id to undo).",
+      inputSchema: {
+        season: z.number().int().describe("seasonIndex or calendar year the award is for"),
+        award: z.string().min(1).describe("Award name, e.g. 'MVP' or 'Super Bowl Champion'"),
+        player: z.string().optional().describe("Player name or rosterId"),
+        team: z.string().optional().describe("Team name (for team awards, or to override the player's team)"),
+        note: z.string().optional().describe("Optional detail, e.g. '2,100 rush yds, 18 TD'"),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ season, award, player, team, note }) => {
+      if (!player && !team) return out({ message: "Give a player or a team for the accolade." });
+      const s = toSeason(season);
+      let who = null;
+      if (player) {
+        const hits = lookupPlayers(player);
+        const exact = hits.filter((p) => norm(fullName(p)) === norm(player) || String(p.rosterId) === String(player).trim());
+        const pickList = exact.length ? exact : hits;
+        if (!pickList.length) return out({ message: `No players match "${player}".` });
+        if (pickList.length > 1)
+          return out({ message: "Several players match; use a rosterId.", matches: pickList.slice(0, 10).map(summary) });
+        const p = pickList[0];
+        const sm = summary(p);
+        who = { name: sm.name, rosterId: String(p.rosterId), pos: sm.pos, team: sm.team };
+      }
+      let teamLabel = null;
+      if (team) {
+        const t = findTeam(team);
+        if (!t) return needTeams(team);
+        teamLabel = teamName(t);
+        if (who) who.team = teamLabel;
+      }
+      const entry = {
+        id: crypto.randomUUID().slice(0, 8),
+        season: s,
+        year: yearFor(s),
+        award: award.trim(),
+        player: who,
+        team: teamLabel ?? who?.team ?? null,
+        note: note ?? null,
+        recordedAt: new Date().toISOString(),
+      };
+      const list = readAccolades(L.id);
+      list.push(entry);
+      writeAccolades(L.id, list);
+      return out({ saved: entry, totalAccolades: list.length });
+    }
+  );
+
+  server.registerTool(
+    "remove_accolade",
+    {
+      description: "Delete a recorded accolade by its id (from get_accolades or record_accolade).",
+      inputSchema: { id: z.string() },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ id }) => {
+      const list = readAccolades(L.id);
+      const keep = list.filter((a) => a.id !== id);
+      if (keep.length === list.length) return out({ message: `No accolade with id "${id}".` });
+      writeAccolades(L.id, keep);
+      return out({ removed: list.find((a) => a.id === id) });
     }
   );
 
@@ -780,6 +1185,8 @@ function buildServer(leagueId) {
           weeklyStats: newest(/\/week\//),
         },
         exportFiles: all.length,
+        seasons: seasonsAvailable(),
+        accolades: readAccolades(L.id).length,
         dataListsSeen: [...listKeysSeen].sort(),
       });
     }
@@ -839,7 +1246,8 @@ app.post("/:key/*", express.raw({ type: () => true, limit: "200mb" }), (req, res
     body = raw;
   }
   try {
-    saveDoc({ path: exportPath, receivedAt: new Date().toISOString(), body });
+    const season = seasonOfBody(body);
+    saveDoc({ key: storageKey(exportPath, season), path: exportPath, season, receivedAt: new Date().toISOString(), body });
     rebuild(leagueOf(exportPath));
   } catch (err) {
     console.error(`Failed to store export ${exportPath}:`, err);
