@@ -1,6 +1,8 @@
 // Madden Franchise MCP server
 //  1) Receives Madden Companion App exports at  https://<your-app>/<SECRET_KEY>
-//  2) Serves the league data to Claude at        https://<your-app>/mcp/<SECRET_KEY>
+//     (any number of leagues can export to this same URL; each is kept separate by its league ID)
+//  2) Serves the league data to Claude at        https://<your-app>/mcp/<SECRET_KEY>            (default league)
+//                                           and  https://<your-app>/mcp/<SECRET_KEY>/<league>   (a specific league)
 
 import express from "express";
 import crypto from "crypto";
@@ -10,7 +12,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-const VERSION = "2.1.0";
+const VERSION = "2.2.0";
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.SECRET_KEY;
 const DATA_DIR = process.env.DATA_DIR || "./data";
@@ -47,17 +49,21 @@ const POSITION_GROUPS = {
 
 // ---------------- storage ----------------
 // Every export is saved as one JSON file per export path (a re-export of the
-// same path replaces the old file). Everything is also kept in memory and the
-// indexes below are rebuilt from memory whenever an export arrives.
+// same path replaces the old file). The Companion App puts the league ID in
+// every export path (/<platform>/<leagueId>/...), so several leagues can export
+// to the same URL: each league's data is indexed separately and never mixed.
 
-const docs = new Map(); // exportPath -> { path, receivedAt, body }
+const docs = new Map(); // exportPath -> { path, receivedAt, body }  (all leagues)
+const leagues = new Map(); // leagueId -> indexed data for that league
 
-let players = new Map(); // rosterId -> player
-let teams = [];
-let standings = [];
-let games = [];
-let playerStats = []; // { rosterId, category, stage, seasonIndex, weekIndex, row }
-let listKeysSeen = new Set();
+function leagueOf(exportPath) {
+  const seg = String(exportPath).split("/").filter(Boolean);
+  return seg.length >= 3 ? seg[1] : "default";
+}
+
+const emptyState = (id) => ({
+  id, docs: [], players: new Map(), teams: [], standings: [], games: [], playerStats: [], listKeysSeen: new Set(),
+});
 
 function fileFor(exportPath) {
   const safe = exportPath.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "");
@@ -88,8 +94,10 @@ const statCategory = (listKey) =>
   listKey.replace(/^player/, "").replace(/StatInfoList$/, "").toLowerCase() || listKey;
 const stageFromPath = (p) => (/\/pre\//i.test(p) ? "preseason" : "regular");
 
-function rebuild() {
-  const ordered = [...docs.values()].sort((a, b) => String(a.receivedAt).localeCompare(String(b.receivedAt)));
+function rebuild(leagueId) {
+  const ordered = [...docs.values()]
+    .filter((d) => leagueOf(d.path) === leagueId)
+    .sort((a, b) => String(a.receivedAt).localeCompare(String(b.receivedAt)));
   const nextPlayers = new Map();
   const nextGames = new Map();
   const nextStats = [];
@@ -138,210 +146,253 @@ function rebuild() {
   const dedup = new Map();
   for (const s of nextStats) dedup.set(`${s.rosterId}|${s.category}|${s.stage}|${s.seasonIndex}|${s.weekIndex}`, s);
 
-  players = nextPlayers;
-  teams = nextTeams;
-  standings = nextStandings;
-  games = [...nextGames.values()];
-  playerStats = [...dedup.values()];
-  listKeysSeen = keys;
+  leagues.set(leagueId, {
+    id: leagueId,
+    docs: ordered,
+    players: nextPlayers,
+    teams: nextTeams,
+    standings: nextStandings,
+    games: [...nextGames.values()],
+    playerStats: [...dedup.values()],
+    listKeysSeen: keys,
+  });
 }
+
+function rebuildAll() {
+  for (const id of new Set([...docs.values()].map((d) => leagueOf(d.path)))) rebuild(id);
+}
+
+// Optional friendly names for leagues, e.g. LEAGUES="main=1234567,second=7654321"
+const ALIASES = new Map(
+  String(process.env.LEAGUES ?? "")
+    .split(",")
+    .map((s) => s.split(/[=:]/).map((x) => x.trim()))
+    .filter(([a, b]) => a && b)
+    .map(([a, b]) => [a.toLowerCase(), b])
+);
+const aliasFor = (id) => [...ALIASES].find(([, v]) => v === id)?.[0] ?? null;
+const resolveLeague = (name) => ALIASES.get(String(name).toLowerCase()) ?? String(name);
+
+// The plain /mcp/<SECRET_KEY> URL serves DEFAULT_LEAGUE if set; otherwise the only
+// league, or (with several) the league whose data has been here the longest.
+const firstSeen = (l) => l.docs.map((d) => String(d.receivedAt)).sort()[0] ?? "9999";
+function defaultLeague() {
+  if (process.env.DEFAULT_LEAGUE) return resolveLeague(process.env.DEFAULT_LEAGUE);
+  const all = [...leagues.values()].sort((a, b) => firstSeen(a).localeCompare(firstSeen(b)));
+  return all[0]?.id ?? "default";
+}
+
+const leagueList = () =>
+  [...leagues.values()].map((l) => ({
+    leagueId: l.id,
+    name: aliasFor(l.id),
+    players: l.players.size,
+    teams: l.teams.length,
+    lastExport: l.docs.map((d) => String(d.receivedAt)).sort().pop() ?? null,
+  }));
 
 loadFromDisk();
-rebuild();
+rebuildAll();
 
-// ---------------- helpers ----------------
+// ---------------- MCP server (one per request, bound to one league) ----------------
 
-const norm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
-const fullName = (p) => `${p.firstName ?? ""} ${p.lastName ?? ""}`.trim();
-const ovr = (p) => p.playerBestOvr ?? p.overallRating ?? p.playerSchemeOvr ?? null;
-const teamById = (id) => teams.find((t) => t.teamId === id);
-const teamName = (t) => (t ? t.displayName || t.nickName || t.abbrName || String(t.teamId) : null);
-const teamNameById = (id) => teamName(teamById(id)) ?? String(id ?? "?");
+function buildServer(leagueId) {
+  const L = leagues.get(leagueId) ?? emptyState(leagueId);
+  const { players, teams, standings, games, playerStats, listKeysSeen } = L;
+  const docs = L.docs; // this league's exports only
 
-function rosterStatus(p) {
-  if (p._freeAgent) return "Free Agent";
-  if (p.isOnIR) return "IR";
-  if (p.isOnPracticeSquad) return "Practice Squad";
-  return "Active";
-}
+  // ---------------- helpers ----------------
 
-function summary(p) {
-  return {
-    name: fullName(p),
-    pos: p.position,
-    team: p._freeAgent ? "Free Agent" : teamNameById(p.teamId),
-    status: rosterStatus(p),
-    age: p.age,
-    ovr: ovr(p),
-    dev: DEV[p.devTrait] ?? p.devTrait,
-    rosterId: p.rosterId,
-  };
-}
+  const norm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const fullName = (p) => `${p.firstName ?? ""} ${p.lastName ?? ""}`.trim();
+  const ovr = (p) => p.playerBestOvr ?? p.overallRating ?? p.playerSchemeOvr ?? null;
+  const teamById = (id) => teams.find((t) => t.teamId === id);
+  const teamName = (t) => (t ? t.displayName || t.nickName || t.abbrName || String(t.teamId) : null);
+  const teamNameById = (id) => teamName(teamById(id)) ?? String(id ?? "?");
 
-function ratings(p) {
-  return Object.fromEntries(
-    Object.entries(p)
-      .filter(([k, v]) => /Rating$/.test(k) && typeof v === "number")
-      .map(([k, v]) => [k.replace(/Rating$/, ""), v])
-      .sort((a, b) => b[1] - a[1])
-  );
-}
-
-const pick = (p, keys) => Object.fromEntries(keys.filter((k) => p[k] !== undefined).map((k) => [k, p[k]]));
-const CONTRACT_KEYS = [
-  "contractLength", "contractYearsLeft", "contractSalary", "contractBonus", "capHit",
-  "capReleasePenalty", "capReleaseNetSavings", "desiredSalary", "desiredBonus", "desiredLength", "reSignStatus",
-];
-const BIO_KEYS = [
-  "jerseyNum", "height", "weight", "college", "homeTown", "homeState", "birthYear", "birthMonth", "birthDay",
-  "rookieYear", "yearsPro", "draftRound", "draftPick", "legacyScore",
-];
-const STATUS_KEYS = ["isOnPracticeSquad", "isOnIR", "injuryType", "injuryLength", "isFreeAgent", "isActive"];
-const GRADE_KEYS = ["playerSchemeOvr", "teamSchemeOvr", "physicalGrade", "sizeGrade", "intangibleGrade", "productionGrade", "durabilityGrade", "experiencePoints", "skillPoints"];
-const HIDDEN_KEYS = new Set(["presentationId", "portraitId", "firstName", "lastName", "position", "age", "rosterId", "teamId", "devTrait", "playerBestOvr"]);
-
-function details(p) {
-  const used = new Set([...CONTRACT_KEYS, ...BIO_KEYS, ...STATUS_KEYS, ...GRADE_KEYS, ...HIDDEN_KEYS]);
-  const traits = {};
-  const other = {};
-  for (const [k, v] of Object.entries(p)) {
-    if (used.has(k) || k.startsWith("_") || /Rating$/.test(k) || (v !== null && typeof v === "object")) continue;
-    if (/Trait$/.test(k)) {
-      if (v) traits[k.replace(/Trait$/, "")] = v; // only non-default traits
-    } else other[k] = v;
+  function rosterStatus(p) {
+    if (p._freeAgent) return "Free Agent";
+    if (p.isOnIR) return "IR";
+    if (p.isOnPracticeSquad) return "Practice Squad";
+    return "Active";
   }
-  return {
-    ...summary(p),
-    ratings: ratings(p),
-    contract: pick(p, CONTRACT_KEYS),
-    injury: p.injuryLength ? pick(p, ["injuryType", "injuryLength", "isOnIR"]) : null,
-    bio: pick(p, BIO_KEYS),
-    grades: pick(p, GRADE_KEYS),
-    traits,
-    other,
-  };
-}
 
-function findPlayers(query) {
-  const raw = String(query).trim();
-  const q = norm(raw);
-  const all = [...players.values()];
-  const byId = all.filter((p) => String(p.rosterId) === raw);
-  if (byId.length) return byId;
-  const exact = all.filter((p) => norm(fullName(p)) === q);
-  if (exact.length) return exact;
-  const last = all.filter((p) => norm(p.lastName) === q);
-  const partial = all.filter((p) => norm(fullName(p)).includes(q));
-  return [...new Set([...last, ...partial])].sort((a, b) => (ovr(b) ?? 0) - (ovr(a) ?? 0));
-}
+  function summary(p) {
+    return {
+      name: fullName(p),
+      pos: p.position,
+      team: p._freeAgent ? "Free Agent" : teamNameById(p.teamId),
+      status: rosterStatus(p),
+      age: p.age,
+      ovr: ovr(p),
+      dev: DEV[p.devTrait] ?? p.devTrait,
+      rosterId: p.rosterId,
+    };
+  }
 
-function findTeam(query) {
-  const q = norm(query);
-  const strings = (t) => Object.values(t).filter((v) => typeof v === "string").map(norm);
-  return (
-    teams.find((t) => String(t.teamId) === String(query).trim()) ||
-    teams.find((t) => strings(t).includes(q)) ||
-    teams.find((t) => strings(t).some((s) => s.includes(q)))
-  );
-}
+  function ratings(p) {
+    return Object.fromEntries(
+      Object.entries(p)
+        .filter(([k, v]) => /Rating$/.test(k) && typeof v === "number")
+        .map(([k, v]) => [k.replace(/Rating$/, ""), v])
+        .sort((a, b) => b[1] - a[1])
+    );
+  }
 
-function positionMatcher(position) {
-  if (!position) return () => true;
-  const wanted = String(position)
-    .split(/[,/ ]+/)
-    .filter(Boolean)
-    .flatMap((x) => POSITION_GROUPS[x.toUpperCase()] ?? [x])
-    .map(norm);
-  return (p) => wanted.includes(norm(p.position));
-}
+  const pick = (p, keys) => Object.fromEntries(keys.filter((k) => p[k] !== undefined).map((k) => [k, p[k]]));
+  const CONTRACT_KEYS = [
+    "contractLength", "contractYearsLeft", "contractSalary", "contractBonus", "capHit",
+    "capReleasePenalty", "capReleaseNetSavings", "desiredSalary", "desiredBonus", "desiredLength", "reSignStatus",
+  ];
+  const BIO_KEYS = [
+    "jerseyNum", "height", "weight", "college", "homeTown", "homeState", "birthYear", "birthMonth", "birthDay",
+    "rookieYear", "yearsPro", "draftRound", "draftPick", "legacyScore",
+  ];
+  const STATUS_KEYS = ["isOnPracticeSquad", "isOnIR", "injuryType", "injuryLength", "isFreeAgent", "isActive"];
+  const GRADE_KEYS = ["playerSchemeOvr", "teamSchemeOvr", "physicalGrade", "sizeGrade", "intangibleGrade", "productionGrade", "durabilityGrade", "experiencePoints", "skillPoints"];
+  const HIDDEN_KEYS = new Set(["presentationId", "portraitId", "firstName", "lastName", "position", "age", "rosterId", "teamId", "devTrait", "playerBestOvr"]);
 
-function ratingKey(sortBy) {
-  const q = norm(sortBy).replace(/rating$/, "");
-  if (!q || ["ovr", "overall"].includes(q)) return null;
-  for (const p of players.values())
-    for (const k of Object.keys(p)) if (/Rating$/.test(k) && norm(k.replace(/Rating$/, "")) === q) return k;
-  return undefined;
-}
-
-const out = (obj) => ({ content: [{ type: "text", text: JSON.stringify(obj, null, 1) }] });
-const noData = () =>
-  out({ message: "No roster data yet. Export League Info and Rosters from the Madden Companion App." });
-const needTeams = (team) =>
-  out({ message: `No team matches "${team}". If this keeps happening, export League Info so team names are known.` });
-
-// Sum a player's weekly stat rows into season totals.
-// Rates/percentages can't be summed, so they're left out of totals; "longest" fields take the max.
-function aggregateStats(rows) {
-  const totals = {};
-  for (const { row } of rows) {
-    for (const [k, v] of Object.entries(row)) {
-      if (typeof v !== "number" || /(Index|Id)$|^rosterId$|^statId$/i.test(k)) continue;
-      if (/Pct|Per|Avg|Rating/i.test(k)) continue;
-      if (/Long/i.test(k)) totals[k] = Math.max(totals[k] ?? -Infinity, v);
-      else totals[k] = (totals[k] ?? 0) + v;
+  function details(p) {
+    const used = new Set([...CONTRACT_KEYS, ...BIO_KEYS, ...STATUS_KEYS, ...GRADE_KEYS, ...HIDDEN_KEYS]);
+    const traits = {};
+    const other = {};
+    for (const [k, v] of Object.entries(p)) {
+      if (used.has(k) || k.startsWith("_") || /Rating$/.test(k) || (v !== null && typeof v === "object")) continue;
+      if (/Trait$/.test(k)) {
+        if (v) traits[k.replace(/Trait$/, "")] = v; // only non-default traits
+      } else other[k] = v;
     }
+    return {
+      ...summary(p),
+      ratings: ratings(p),
+      contract: pick(p, CONTRACT_KEYS),
+      injury: p.injuryLength ? pick(p, ["injuryType", "injuryLength", "isOnIR"]) : null,
+      bio: pick(p, BIO_KEYS),
+      grades: pick(p, GRADE_KEYS),
+      traits,
+      other,
+    };
   }
-  return totals;
-}
 
-// ---------------- contracts ----------------
-// Companion App money fields: capHit / capReleasePenalty / capReleaseNetSavings are in $10,000 units
-// (capHit 1000 = $10.0M per year); contractSalary / contractBonus are full-contract dollar totals.
-const capM = (v) => (typeof v === "number" ? Math.round(v) / 100 : null); // -> $ millions
-const dollarsM = (v) => (typeof v === "number" ? Math.round(v / 10000) / 100 : null);
-
-function contractRow(p) {
-  return {
-    ...summary(p),
-    capHitM: capM(p.capHit),
-    yearsLeft: p.contractYearsLeft ?? null,
-    length: p.contractLength ?? null,
-    totalSalaryM: dollarsM(p.contractSalary),
-    totalBonusM: dollarsM(p.contractBonus),
-    remainingCapM: p.capHit != null && p.contractYearsLeft != null ? capM(p.capHit * p.contractYearsLeft) : null,
-    deadCapIfCutM: capM(p.capReleasePenalty),
-    savingsIfCutM: dollarsM(p.capReleaseNetSavings),
-  };
-}
-
-// "Market" cap hit for an OVR = median cap hit of rostered (non-FA) players at that OVR.
-// Overpay = player's cap hit minus that median. Buckets with few players borrow from neighbours.
-function marketByOvr(pool) {
-  const by = new Map();
-  for (const p of pool) {
-    const o = ovr(p);
-    if (o == null || typeof p.capHit !== "number") continue;
-    if (!by.has(o)) by.set(o, []);
-    by.get(o).push(p.capHit);
+  function findPlayers(query) {
+    const raw = String(query).trim();
+    const q = norm(raw);
+    const all = [...players.values()];
+    const byId = all.filter((p) => String(p.rosterId) === raw);
+    if (byId.length) return byId;
+    const exact = all.filter((p) => norm(fullName(p)) === q);
+    if (exact.length) return exact;
+    const last = all.filter((p) => norm(p.lastName) === q);
+    const partial = all.filter((p) => norm(fullName(p)).includes(q));
+    return [...new Set([...last, ...partial])].sort((a, b) => (ovr(b) ?? 0) - (ovr(a) ?? 0));
   }
-  const median = (a) => {
-    const s = [...a].sort((x, y) => x - y);
-    const m = Math.floor(s.length / 2);
-    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
-  };
-  const cache = new Map();
-  return (o) => {
-    if (cache.has(o)) return cache.get(o);
-    let vals = [];
-    for (let w = 0; w <= 5 && vals.length < 8; w++) {
-      vals = [];
-      for (let k = o - w; k <= o + w; k++) vals.push(...(by.get(k) ?? []));
+
+  function findTeam(query) {
+    const q = norm(query);
+    const strings = (t) => Object.values(t).filter((v) => typeof v === "string").map(norm);
+    return (
+      teams.find((t) => String(t.teamId) === String(query).trim()) ||
+      teams.find((t) => strings(t).includes(q)) ||
+      teams.find((t) => strings(t).some((s) => s.includes(q)))
+    );
+  }
+
+  function positionMatcher(position) {
+    if (!position) return () => true;
+    const wanted = String(position)
+      .split(/[,/ ]+/)
+      .filter(Boolean)
+      .flatMap((x) => POSITION_GROUPS[x.toUpperCase()] ?? [x])
+      .map(norm);
+    return (p) => wanted.includes(norm(p.position));
+  }
+
+  function ratingKey(sortBy) {
+    const q = norm(sortBy).replace(/rating$/, "");
+    if (!q || ["ovr", "overall"].includes(q)) return null;
+    for (const p of players.values())
+      for (const k of Object.keys(p)) if (/Rating$/.test(k) && norm(k.replace(/Rating$/, "")) === q) return k;
+    return undefined;
+  }
+
+  const out = (obj) => ({ content: [{ type: "text", text: JSON.stringify(obj, null, 1) }] });
+  const noData = () =>
+    out({ message: "No roster data yet. Export League Info and Rosters from the Madden Companion App." });
+  const needTeams = (team) =>
+    out({ message: `No team matches "${team}". If this keeps happening, export League Info so team names are known.` });
+
+  // Sum a player's weekly stat rows into season totals.
+  // Rates/percentages can't be summed, so they're left out of totals; "longest" fields take the max.
+  function aggregateStats(rows) {
+    const totals = {};
+    for (const { row } of rows) {
+      for (const [k, v] of Object.entries(row)) {
+        if (typeof v !== "number" || /(Index|Id)$|^rosterId$|^statId$/i.test(k)) continue;
+        if (/Pct|Per|Avg|Rating/i.test(k)) continue;
+        if (/Long/i.test(k)) totals[k] = Math.max(totals[k] ?? -Infinity, v);
+        else totals[k] = (totals[k] ?? 0) + v;
+      }
     }
-    const v = vals.length ? median(vals) : null;
-    cache.set(o, v);
-    return v;
-  };
-}
+    return totals;
+  }
 
-const latestSeason = () =>
-  Math.max(-1, ...playerStats.map((s) => s.seasonIndex ?? -1), ...games.map((g) => g.seasonIndex ?? -1));
+  // ---------------- contracts ----------------
+  // Companion App money fields: capHit / capReleasePenalty / capReleaseNetSavings are in $10,000 units
+  // (capHit 1000 = $10.0M per year); contractSalary / contractBonus are full-contract dollar totals.
+  const capM = (v) => (typeof v === "number" ? Math.round(v) / 100 : null); // -> $ millions
+  const dollarsM = (v) => (typeof v === "number" ? Math.round(v / 10000) / 100 : null);
 
-// ---------------- MCP tools ----------------
+  function contractRow(p) {
+    return {
+      ...summary(p),
+      capHitM: capM(p.capHit),
+      yearsLeft: p.contractYearsLeft ?? null,
+      length: p.contractLength ?? null,
+      totalSalaryM: dollarsM(p.contractSalary),
+      totalBonusM: dollarsM(p.contractBonus),
+      remainingCapM: p.capHit != null && p.contractYearsLeft != null ? capM(p.capHit * p.contractYearsLeft) : null,
+      deadCapIfCutM: capM(p.capReleasePenalty),
+      savingsIfCutM: dollarsM(p.capReleaseNetSavings),
+    };
+  }
 
-const RO = { readOnlyHint: true, openWorldHint: false };
+  // "Market" cap hit for an OVR = median cap hit of rostered (non-FA) players at that OVR.
+  // Overpay = player's cap hit minus that median. Buckets with few players borrow from neighbours.
+  function marketByOvr(pool) {
+    const by = new Map();
+    for (const p of pool) {
+      const o = ovr(p);
+      if (o == null || typeof p.capHit !== "number") continue;
+      if (!by.has(o)) by.set(o, []);
+      by.get(o).push(p.capHit);
+    }
+    const median = (a) => {
+      const s = [...a].sort((x, y) => x - y);
+      const m = Math.floor(s.length / 2);
+      return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+    };
+    const cache = new Map();
+    return (o) => {
+      if (cache.has(o)) return cache.get(o);
+      let vals = [];
+      for (let w = 0; w <= 5 && vals.length < 8; w++) {
+        vals = [];
+        for (let k = o - w; k <= o + w; k++) vals.push(...(by.get(k) ?? []));
+      }
+      const v = vals.length ? median(vals) : null;
+      cache.set(o, v);
+      return v;
+    };
+  }
 
-function buildServer() {
+  const latestSeason = () =>
+    Math.max(-1, ...playerStats.map((s) => s.seasonIndex ?? -1), ...games.map((g) => g.seasonIndex ?? -1));
+
+  // ---------------- MCP tools ----------------
+
+  const RO = { readOnlyHint: true, openWorldHint: false };
   const server = new McpServer({ name: "madden-franchise", version: VERSION });
+
 
   server.registerTool(
     "search_players",
@@ -702,7 +753,7 @@ function buildServer() {
     "data_status",
     {
       description:
-        "Check what league data the server has and how fresh it is: player/team counts, last roster/stats/league-info export times, and the server version. Use this first if data looks stale or missing.",
+        "Check what league data the server has and how fresh it is: which league this connector reads, player/team counts, last roster/stats/league-info export times, every league stored on the server, and the server version. Use this first if data looks stale or missing.",
       inputSchema: {},
       annotations: RO,
     },
@@ -713,6 +764,8 @@ function buildServer() {
       const ps = [...players.values()].filter((p) => p.isOnPracticeSquad).length;
       return out({
         serverVersion: VERSION,
+        league: { leagueId: L.id, name: aliasFor(L.id) },
+        allLeagues: leagueList(),
         players: players.size,
         freeAgents: [...players.values()].filter((p) => p._freeAgent).length,
         practiceSquadPlayers: ps,
@@ -740,14 +793,15 @@ function buildServer() {
 const app = express();
 
 app.get("/health", (req, res) =>
-  res.json({ ok: true, version: VERSION, players: players.size, teams: teams.length, exportFiles: docs.size })
+  res.json({ ok: true, version: VERSION, defaultLeague: defaultLeague(), leagues: leagueList(), exportFiles: docs.size })
 );
 
-// Claude connector endpoint (stateless: a fresh MCP server per request)
-app.post("/mcp/:key", express.json({ limit: "10mb" }), async (req, res) => {
-  if (!keyOk(req.params.key)) return res.status(404).end();
+// Claude connector endpoints (stateless: a fresh MCP server per request)
+//   /mcp/<SECRET_KEY>           -> default league
+//   /mcp/<SECRET_KEY>/<league>  -> that league (league ID, or a name from LEAGUES)
+async function handleMcp(req, res, leagueId) {
   try {
-    const server = buildServer();
+    const server = buildServer(leagueId);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       transport.close();
@@ -760,8 +814,14 @@ app.post("/mcp/:key", express.json({ limit: "10mb" }), async (req, res) => {
     if (!res.headersSent)
       res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" }, id: null });
   }
-});
-app.all("/mcp/:key", (req, res) => {
+}
+app.post("/mcp/:key", express.json({ limit: "10mb" }), (req, res) =>
+  keyOk(req.params.key) ? handleMcp(req, res, defaultLeague()) : res.status(404).end()
+);
+app.post("/mcp/:key/:league", express.json({ limit: "10mb" }), (req, res) =>
+  keyOk(req.params.key) ? handleMcp(req, res, resolveLeague(req.params.league)) : res.status(404).end()
+);
+app.all(["/mcp/:key", "/mcp/:key/:league"], (req, res) => {
   if (!keyOk(req.params.key)) return res.status(404).end();
   res.status(405).set("Allow", "POST").json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null });
 });
@@ -780,7 +840,7 @@ app.post("/:key/*", express.raw({ type: () => true, limit: "200mb" }), (req, res
   }
   try {
     saveDoc({ path: exportPath, receivedAt: new Date().toISOString(), body });
-    rebuild();
+    rebuild(leagueOf(exportPath));
   } catch (err) {
     console.error(`Failed to store export ${exportPath}:`, err);
     return res.status(500).json({ ok: false });
@@ -788,8 +848,14 @@ app.post("/:key/*", express.raw({ type: () => true, limit: "200mb" }), (req, res
   const lists = body && typeof body === "object"
     ? Object.entries(body).filter(([, v]) => Array.isArray(v)).map(([k, v]) => `${k}:${v.length}`).join(" ")
     : "not JSON";
-  console.log(`Export received: ${exportPath} (${raw.length} bytes) ${lists}`);
+  console.log(`Export received [league ${leagueOf(exportPath)}]: ${exportPath} (${raw.length} bytes) ${lists}`);
   res.json({ ok: true });
 });
 
-app.listen(PORT, () => console.log(`Madden MCP v${VERSION} listening on ${PORT}. Players loaded: ${players.size}`));
+app.listen(PORT, () =>
+  console.log(
+    `Madden MCP v${VERSION} listening on ${PORT}. Leagues: ` +
+      (leagueList().map((l) => `${l.name ?? l.leagueId} (${l.players} players)`).join(", ") || "none yet") +
+      `. Default: ${defaultLeague()}`
+  )
+);

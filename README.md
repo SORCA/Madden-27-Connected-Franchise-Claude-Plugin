@@ -27,6 +27,21 @@ Re-export after signings, trades, releases, progression, or a played week. Each 
 Claude → Settings → Connectors → Add custom connector → URL:
 `https://something.up.railway.app/mcp/YOUR_SECRET_KEY`
 
+## More than one league
+Every league can export to the **same** URL. The Companion App puts the league ID in each export,
+so the server keeps each league's data separate (rosters, teams, stats are never mixed).
+
+- `https://something.up.railway.app/mcp/YOUR_SECRET_KEY` reads the **default** league.
+- `https://something.up.railway.app/mcp/YOUR_SECRET_KEY/LEAGUE` reads a specific league, where `LEAGUE` is its league ID
+  (shown at `/health` after the league's first export) or a name you set below.
+
+Add one Claude connector per league, each with its own URL and a clear name (e.g. "Madden – Main", "Madden – League 2").
+
+Optional variables:
+- `LEAGUES` = friendly names, e.g. `main=1234567,second=7654321`, so URLs can end in `/main` or `/second`.
+- `DEFAULT_LEAGUE` = the league ID (or name) the plain `/mcp/YOUR_SECRET_KEY` URL should read.
+  If unset: the only league, or with several, the league that has been on the server the longest.
+
 ## Tools
 - `search_players`: find anyone by name
 - `get_player`: full ratings, contract, status, injury, bio, traits
@@ -37,8 +52,8 @@ Claude → Settings → Connectors → Add custom connector → URL:
 - `get_contracts`: league-wide contracts (cap hit, years left, dead cap, savings if cut); sort by worst value (overpay vs. players at the same OVR), cap hit, remaining money, dead cap, total value, or best value
 - `get_player_stats`: season totals from weekly stat exports
 - `get_standings`, `get_schedule`
-- `data_status`: server version and when each kind of data was last exported
+- `data_status`: which league the connector reads, every league on the server, server version, and when each kind of data was last exported
 
 Position groups: OL, OT, OG, IOL, EDGE/DE, DL, LB, OLB, MLB, S, DB, RB, ST.
 
-Built for one franchise. Exports from a second league would mix in.
+Supports any number of franchises on one deployment (see "More than one league").
