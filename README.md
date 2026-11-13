@@ -35,7 +35,13 @@ so the server keeps each league's data separate (rosters, teams, stats are never
 - `https://something.up.railway.app/mcp/YOUR_SECRET_KEY/LEAGUE` reads a specific league, where `LEAGUE` is its league ID
   (shown at `/health` after the league's first export) or a name you set below.
 
-Add one Claude connector per league, each with its own URL and a clear name (e.g. "Madden – Main", "Madden – League 2").
+Every tool also takes an optional `league` argument (a league ID or a name from `LEAGUES`), so **one
+connector can read any league** that has exported here — ask Claude for "the hybrid league's free agents"
+and it reads that league without changing anything. Omit it and the tool reads the league the URL is
+bound to. `data_status` lists every league on the server.
+
+A connector per league still works, and is handy if you want each one named separately in Claude
+(e.g. "Madden – Main", "Madden – League 2").
 
 Optional variables:
 - `LEAGUES` = friendly names, e.g. `main=1234567,second=7654321`, so URLs can end in `/main` or `/second`.
