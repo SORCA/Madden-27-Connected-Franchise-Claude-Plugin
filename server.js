@@ -3,6 +3,7 @@
 //     (any number of leagues can export to this same URL; each is kept separate by its league ID)
 //  2) Serves the league data to Claude at        https://<your-app>/mcp/<SECRET_KEY>            (default league)
 //                                           and  https://<your-app>/mcp/<SECRET_KEY>/<league>   (a specific league)
+//     Every tool also takes an optional `league` argument, so one connector can read any league.
 
 import express from "express";
 import crypto from "crypto";
@@ -12,7 +13,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-const VERSION = "2.3.0";
+const VERSION = "2.4.0";
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.SECRET_KEY;
 const DATA_DIR = process.env.DATA_DIR || "./data";
@@ -262,9 +263,9 @@ function writeAccolades(leagueId, list) {
 // Regular-season weeks are weekIndex 0..REG_SEASON_WEEKS-1; later weeks are playoffs.
 const REG_SEASON_WEEKS = Number(process.env.REG_SEASON_WEEKS) || 18;
 
-// ---------------- MCP server (one per request, bound to one league) ----------------
+// ---------------- MCP tools (collected per league, then wired up by buildServer) ----------------
 
-function buildServer(leagueId) {
+function collectTools(leagueId) {
   const L = leagues.get(leagueId) ?? emptyState(leagueId);
   const { players, teams, standings, standingsBySeason, games, playerStats, teamStats, listKeysSeen } = L;
   const docs = L.docs; // this league's exports only
@@ -606,7 +607,10 @@ function buildServer(leagueId) {
   // ---------------- MCP tools ----------------
 
   const RO = { readOnlyHint: true, openWorldHint: false };
-  const server = new McpServer({ name: "madden-franchise", version: VERSION });
+  // Registrations are captured rather than attached to a live server, so buildServer can
+  // wrap each handler and route a call to another league when one is asked for.
+  const regs = [];
+  const server = { registerTool: (name, config, handler) => regs.push([name, config, handler]) };
 
 
   server.registerTool(
@@ -1191,6 +1195,48 @@ function buildServer(leagueId) {
       });
     }
   );
+
+  return regs;
+}
+
+// ---------------- MCP server (one per request) ----------------
+// Each tool takes an optional `league`, so a single connector URL can read any league
+// that has exported here. Without it, a tool reads the league the URL is bound to.
+function buildServer(leagueId) {
+  const server = new McpServer({ name: "madden-franchise", version: VERSION });
+  const tables = new Map([[leagueId, collectTools(leagueId)]]);
+  const tableFor = (id) => {
+    if (!tables.has(id)) tables.set(id, collectTools(id));
+    return tables.get(id);
+  };
+  const text = (obj) => ({ content: [{ type: "text", text: JSON.stringify(obj, null, 1) }] });
+
+  for (const [name, config, handler] of tableFor(leagueId)) {
+    const schema = {
+      ...(config.inputSchema ?? {}),
+      league: z
+        .string()
+        .optional()
+        .describe(
+          "Optional league ID or name to read instead of this connector's default league. " +
+            "Call data_status to see every league stored on the server."
+        ),
+    };
+    server.registerTool(name, { ...config, inputSchema: schema }, async (args = {}, extra) => {
+      const { league, ...rest } = args;
+      if (league == null || league === "") return handler(rest, extra);
+      const target = resolveLeague(league);
+      if (target === leagueId) return handler(rest, extra);
+      if (!leagues.has(target))
+        return text({
+          message: `No league "${league}" on this server.`,
+          availableLeagues: leagueList(),
+        });
+      const other = tableFor(target).find((r) => r[0] === name);
+      if (!other) return handler(rest, extra);
+      return other[2](rest, extra);
+    });
+  }
 
   return server;
 }
