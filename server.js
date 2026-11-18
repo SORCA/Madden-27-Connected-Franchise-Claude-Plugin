@@ -636,7 +636,7 @@ function collectTools(leagueId) {
     "search_players",
     {
       description:
-        "Search every player in the franchise (all teams and free agency) by full or partial name. Returns name, position, team, roster status (Active / Practice Squad / IR / Free Agent), age, overall and dev trait.",
+        "Search every player in the franchise (all teams and free agency) by full or partial name. Returns name, position, team, roster status (Active / Practice Squad / IR / Free Agent), age, overall, dev trait, height and weight.",
       inputSchema: { name: z.string().describe("Full or partial player name") },
       annotations: RO,
     },
@@ -644,7 +644,7 @@ function collectTools(leagueId) {
       if (!players.size) return noData();
       const hits = findPlayers(name);
       if (!hits.length) return out({ message: `No players match "${name}".` });
-      return out(hits.slice(0, 25).map(summary));
+      return out(hits.slice(0, 25).map((p) => ({ ...summary(p), ...sizeOf(p) })));
     }
   );
 
@@ -661,7 +661,10 @@ function collectTools(leagueId) {
       const hits = findPlayers(name);
       if (!hits.length) return out({ message: `No players match "${name}".` });
       if (hits.length > 3)
-        return out({ message: "Several matches; be more specific or use a rosterId.", matches: hits.slice(0, 25).map(summary) });
+        return out({
+          message: "Several matches; be more specific or use a rosterId.",
+          matches: hits.slice(0, 25).map((p) => ({ ...summary(p), ...sizeOf(p) })),
+        });
       return out(hits.map(details));
     }
   );
@@ -700,7 +703,7 @@ function collectTools(leagueId) {
     "get_team_roster",
     {
       description:
-        "List a team's roster with each player's position, age, overall, dev trait and roster status. Shows active-roster, practice-squad and IR counts. Filter by position or position group (OL, DL, EDGE, LB, DB, S, RB, ST) and by status.",
+        "List a team's roster with each player's position, age, overall, dev trait, height, weight and roster status. Shows active-roster, practice-squad and IR counts. Filter by position or position group (OL, DL, EDGE, LB, DB, S, RB, ST) and by status.",
       inputSchema: {
         team: z.string().describe("Team name, city, abbreviation or teamId, e.g. 'Packers' or 'GB'"),
         position: z.string().optional().describe("Position or group, e.g. 'WR', 'OL', 'CB,S'"),
@@ -730,7 +733,7 @@ function collectTools(leagueId) {
       const players_ = list.map(({ ...p }) => {
         const s = summary(p);
         delete s.team;
-        return s;
+        return { ...s, ...sizeOf(p) };
       });
       return out({ team: teamName(t), counts, shown: list.length, players: players_ });
     }
@@ -818,7 +821,7 @@ function collectTools(leagueId) {
   server.registerTool(
     "get_free_agents",
     {
-      description: "List free agents, best first, optionally filtered by position/group, minimum overall and maximum age.",
+      description: "List free agents, best first, optionally filtered by position/group, minimum overall and maximum age. Each result carries height and weight.",
       inputSchema: {
         position: z.string().optional().describe("Position or group, e.g. 'K', 'OL'"),
         min_ovr: z.number().optional(),
@@ -839,6 +842,7 @@ function collectTools(leagueId) {
         matches: list.length,
         players: list.slice(0, limit).map((p) => ({
           ...summary(p),
+          ...sizeOf(p),
           askingSalary: p.desiredSalary,
           askingBonus: p.desiredBonus,
           askingYears: p.desiredLength,
