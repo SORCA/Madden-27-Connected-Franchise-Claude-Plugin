@@ -377,6 +377,25 @@ function collectTools(leagueId) {
     return (p) => wanted.includes(norm(p.position));
   }
 
+  // Size helpers. Madden exports height in inches and weight in pounds.
+  // Accepts a number of inches (75) or feet-inches text ("6'3", "6-3", "6ft3", "6'3\"").
+  function parseHeight(v) {
+    if (v == null) return undefined;
+    if (typeof v === "number") return Number.isFinite(v) ? v : undefined;
+    const s = String(v).trim();
+    let m = s.match(/^(\d+)\s*(?:'|\u2019|ft\.?|feet|-)\s*(\d+(?:\.\d+)?)?\s*(?:"|\u201d|in\.?|inches)?$/i);
+    if (m) return Number(m[1]) * 12 + Number(m[2] ?? 0);
+    m = s.match(/^(\d+(?:\.\d+)?)\s*(?:"|\u201d|in\.?|inches)?$/i);
+    if (m) return Number(m[1]);
+    return undefined;
+  }
+  const formatHeight = (h) =>
+    typeof h === "number" && h > 0 ? `${Math.floor(h / 12)}'${Math.round(h % 12)}"` : undefined;
+  const sizeOf = (p) => ({
+    ...(p.height ? { ht: formatHeight(p.height), htIn: p.height } : {}),
+    ...(p.weight ? { wt: p.weight } : {}),
+  });
+
   function ratingKey(sortBy) {
     const q = norm(sortBy).replace(/rating$/, "");
     if (!q || ["ovr", "overall"].includes(q)) return null;
@@ -721,13 +740,17 @@ function collectTools(leagueId) {
     "find_players",
     {
       description:
-        "Search the whole league with filters: position/group, team, age range, minimum overall, dev trait, roster status. Sort by overall, age, or any rating (e.g. 'speed', 'awareness', 'zoneCover'). Good for trade targets, e.g. 'young Star+ HBs 80+'.",
+        "Search the whole league with filters: position/group, team, age range, height range, weight range, minimum overall, dev trait, roster status. Sort by overall, age, height, weight, or any rating (e.g. 'speed', 'awareness', 'zoneCover'). Heights accept inches (75) or feet-inches (\"6'3\"). Every result carries the player's height and weight. Good for trade targets, e.g. 'young Star+ HBs 80+' or '6'3+ CBs with 90+ speed'.",
       inputSchema: {
         position: z.string().optional().describe("Position or group, e.g. 'HB', 'OL', 'EDGE', 'CB,S'"),
         team: z.string().optional().describe("Limit to one team, or 'free agents'"),
         min_ovr: z.number().optional(),
         min_age: z.number().optional(),
         max_age: z.number().optional(),
+        min_height: z.union([z.number(), z.string()]).optional().describe("Minimum height: inches (75) or feet-inches (\"6'3\")"),
+        max_height: z.union([z.number(), z.string()]).optional().describe("Maximum height, same formats"),
+        min_weight: z.number().optional().describe("Minimum weight in pounds"),
+        max_weight: z.number().optional().describe("Maximum weight in pounds"),
         dev: z.array(z.enum(["Normal", "Star", "Superstar", "X-Factor"])).optional().describe("Dev traits to include"),
         status: z.enum(["any", "active", "practice_squad", "ir", "free_agent"]).optional(),
         sort_by: z.string().optional().describe("'ovr' (default), 'age', or a rating name like 'speed'"),
@@ -735,7 +758,7 @@ function collectTools(leagueId) {
       },
       annotations: RO,
     },
-    async ({ position, team, min_ovr, min_age, max_age, dev, status = "any", sort_by = "ovr", limit = 25 }) => {
+    async ({ position, team, min_ovr, min_age, max_age, min_height, max_height, min_weight, max_weight, dev, status = "any", sort_by = "ovr", limit = 25 }) => {
       if (!players.size) return noData();
       let list = [...players.values()].filter(positionMatcher(position));
       if (team) {
@@ -749,6 +772,16 @@ function collectTools(leagueId) {
       if (min_ovr != null) list = list.filter((p) => (ovr(p) ?? 0) >= min_ovr);
       if (min_age != null) list = list.filter((p) => (p.age ?? 0) >= min_age);
       if (max_age != null) list = list.filter((p) => (p.age ?? 99) <= max_age);
+      const minH = parseHeight(min_height);
+      const maxH = parseHeight(max_height);
+      if (min_height != null && minH === undefined)
+        return out({ message: `Couldn't read min_height "${min_height}". Use inches (75) or feet-inches ("6'3").` });
+      if (max_height != null && maxH === undefined)
+        return out({ message: `Couldn't read max_height "${max_height}". Use inches (75) or feet-inches ("6'3").` });
+      if (minH != null) list = list.filter((p) => (p.height ?? 0) >= minH);
+      if (maxH != null) list = list.filter((p) => (p.height ?? 999) <= maxH);
+      if (min_weight != null) list = list.filter((p) => (p.weight ?? 0) >= min_weight);
+      if (max_weight != null) list = list.filter((p) => (p.weight ?? 9999) <= max_weight);
       if (dev?.length) list = list.filter((p) => dev.includes(DEV[p.devTrait]));
       const wantStatus = { any: null, active: "Active", practice_squad: "Practice Squad", ir: "IR", free_agent: "Free Agent" }[status];
       if (wantStatus) list = list.filter((p) => rosterStatus(p) === wantStatus);
@@ -758,6 +791,12 @@ function collectTools(leagueId) {
       if (norm(sort_by) === "age") {
         sortVal = (p) => -(p.age ?? 99);
         sortLabel = "age (youngest first)";
+      } else if (["height", "ht", "tall", "tallest"].includes(norm(sort_by))) {
+        sortVal = (p) => p.height ?? 0;
+        sortLabel = "height";
+      } else if (["weight", "wt", "heaviest"].includes(norm(sort_by))) {
+        sortVal = (p) => p.weight ?? 0;
+        sortLabel = "weight";
       } else {
         const key = ratingKey(sort_by);
         if (key === undefined) return out({ message: `Unknown rating "${sort_by}". Try e.g. speed, awareness, catch, zoneCover.` });
@@ -771,7 +810,7 @@ function collectTools(leagueId) {
       return out({
         matches: list.length,
         sortedBy: sortLabel,
-        players: list.slice(0, limit).map((p) => ({ ...summary(p), ...(key ? { [sortLabel]: p[key] } : {}) })),
+        players: list.slice(0, limit).map((p) => ({ ...summary(p), ...sizeOf(p), ...(key ? { [sortLabel]: p[key] } : {}) })),
       });
     }
   );

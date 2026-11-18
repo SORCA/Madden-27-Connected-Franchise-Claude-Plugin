@@ -60,7 +60,7 @@ Recorded accolades are kept in `DATA_DIR/accolades/`.
 - `get_player`: full ratings, contract, status, injury, bio, traits
 - `compare_players`: 2-5 players side by side
 - `get_team_roster`: roster with Active / Practice Squad / IR status and counts; filter by position group or status
-- `find_players`: league-wide filters (position group, age, OVR, dev, status) sorted by OVR, age or any rating
+- `find_players`: league-wide filters (position group, age, height, weight, OVR, dev, status) sorted by OVR, age, height, weight or any rating; heights accept inches (`75`) or feet-inches (`6'3`), and every result carries the player's height and weight
 - `get_free_agents`: best available, with asking contract
 - `get_contracts`: league-wide contracts (cap hit, years left, dead cap, savings if cut); sort by worst value (overpay vs. players at the same OVR), cap hit, remaining money, dead cap, total value, or best value
 - `get_player_stats`: season totals from weekly stat exports
