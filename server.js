@@ -148,15 +148,20 @@ function rebuild(leagueId) {
         nextPlayers.set(id, { ...p, _freeAgent: fromFaExport || p.isFreeAgent === true });
       }
     }
-    if (Array.isArray(body.leagueTeamInfoList)) {
-      nextTeams = body.leagueTeamInfoList;
-      // Madden can renumber teamIds between exports (new franchise file, re-import, etc).
-      // Keep every id a franchise has ever used so older schedule and stat rows still resolve.
-      for (const t of body.leagueTeamInfoList) {
-        const key = teamKeyOf(t);
-        if (!key || t.teamId == null) continue;
+    if (Array.isArray(body.leagueTeamInfoList)) nextTeams = body.leagueTeamInfoList;
+    // Madden can renumber teamIds between exports (a re-import, a new franchise file).
+    // Harvest every (team name -> teamId) pair from every list in every export, so rows
+    // written before a renumber still resolve. leagueTeamInfoList alone is not enough:
+    // the Companion App overwrites that export, so only the newest ids survive in it.
+    // Standings, team stats and teamIdInfoList rows all carry a name beside the id.
+    for (const v of Object.values(body)) {
+      if (!Array.isArray(v)) continue;
+      for (const row of v) {
+        if (!row || typeof row !== "object" || row.teamId == null) continue;
+        const key = teamKeyOf(row);
+        if (!key) continue;
         if (!teamIdAliases.has(key)) teamIdAliases.set(key, new Set());
-        teamIdAliases.get(key).add(t.teamId);
+        teamIdAliases.get(key).add(row.teamId);
       }
     }
     if (Array.isArray(body.teamStandingInfoList)) {
