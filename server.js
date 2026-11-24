@@ -66,6 +66,7 @@ function leagueOf(exportPath) {
 
 const emptyState = (id) => ({
   id, docs: [], players: new Map(), teams: [], standings: [], standingsBySeason: new Map(), games: [],
+  teamIdAliases: new Map(),
   playerStats: [], teamStats: [], listKeysSeen: new Set(),
 });
 
@@ -114,6 +115,12 @@ const statCategory = (listKey) =>
   listKey.replace(/^player/, "").replace(/StatInfoList$/, "").toLowerCase() || listKey;
 const stageFromPath = (p) => (/\/pre\//i.test(p) ? "preseason" : "regular");
 
+// A franchise's stable identity across exports: its name, not its (re-numberable) teamId.
+function teamKeyOf(t) {
+  const v = t?.displayName || t?.nickName || t?.abbrName || t?.teamName;
+  return v ? String(v).toLowerCase().replace(/[^a-z0-9]/g, "") : null;
+}
+
 function rebuild(leagueId) {
   const ordered = [...docs.values()]
     .filter((d) => leagueOf(d.path) === leagueId)
@@ -123,6 +130,7 @@ function rebuild(leagueId) {
   const nextStats = [];
   const nextTeamStats = [];
   const standingsBySeason = new Map(); // seasonIndex -> latest standings rows for that season
+  const teamIdAliases = new Map(); // stable team key -> Set of every teamId that franchise has used
   const keys = new Set();
   let nextTeams = [];
   let nextStandings = [];
@@ -140,7 +148,17 @@ function rebuild(leagueId) {
         nextPlayers.set(id, { ...p, _freeAgent: fromFaExport || p.isFreeAgent === true });
       }
     }
-    if (Array.isArray(body.leagueTeamInfoList)) nextTeams = body.leagueTeamInfoList;
+    if (Array.isArray(body.leagueTeamInfoList)) {
+      nextTeams = body.leagueTeamInfoList;
+      // Madden can renumber teamIds between exports (new franchise file, re-import, etc).
+      // Keep every id a franchise has ever used so older schedule and stat rows still resolve.
+      for (const t of body.leagueTeamInfoList) {
+        const key = teamKeyOf(t);
+        if (!key || t.teamId == null) continue;
+        if (!teamIdAliases.has(key)) teamIdAliases.set(key, new Set());
+        teamIdAliases.get(key).add(t.teamId);
+      }
+    }
     if (Array.isArray(body.teamStandingInfoList)) {
       nextStandings = body.teamStandingInfoList;
       const season = doc.season ?? seasonOfBody(body);
@@ -198,6 +216,7 @@ function rebuild(leagueId) {
     standings: nextStandings,
     standingsBySeason,
     games: [...nextGames.values()],
+    teamIdAliases,
     playerStats: [...dedup.values()],
     teamStats: [...teamDedup.values()],
     listKeysSeen: keys,
@@ -267,7 +286,7 @@ const REG_SEASON_WEEKS = Number(process.env.REG_SEASON_WEEKS) || 18;
 
 function collectTools(leagueId) {
   const L = leagues.get(leagueId) ?? emptyState(leagueId);
-  const { players, teams, standings, standingsBySeason, games, playerStats, teamStats, listKeysSeen } = L;
+  const { players, teams, standings, standingsBySeason, games, playerStats, teamStats, listKeysSeen, teamIdAliases } = L;
   const docs = L.docs; // this league's exports only
 
   // ---------------- helpers ----------------
@@ -275,7 +294,16 @@ function collectTools(leagueId) {
   const norm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
   const fullName = (p) => `${p.firstName ?? ""} ${p.lastName ?? ""}`.trim();
   const ovr = (p) => p.playerBestOvr ?? p.overallRating ?? p.playerSchemeOvr ?? null;
-  const teamById = (id) => teams.find((t) => t.teamId === id);
+  // Every teamId this franchise has used, newest first. Madden renumbers ids between
+  // exports, so rows written before a renumber carry an id the current roster no longer has.
+  function teamIds(t) {
+    const ids = new Set();
+    if (t?.teamId != null) ids.add(t.teamId);
+    for (const id of teamIdAliases.get(teamKeyOf(t)) ?? []) ids.add(id);
+    return ids;
+  }
+  const isTeam = (t, id) => id != null && teamIds(t).has(id);
+  const teamById = (id) => teams.find((t) => t.teamId === id) ?? teams.find((t) => isTeam(t, id));
   const teamName = (t) => (t ? t.displayName || t.nickName || t.abbrName || String(t.teamId) : null);
   const teamNameById = (id) => teamName(teamById(id)) ?? String(id ?? "?");
 
@@ -556,8 +584,9 @@ function collectTools(leagueId) {
   function leaders(category, stat, season, { phase = "regular", teamId = null, limit = 10 } = {}) {
     let list = seasonTotals(category, season, phase);
     if (teamId != null) {
+      const teamIdSet = teamIds(teamById(teamId) ?? { teamId });
       list = list
-        .map((e) => ({ ...e, rows: e.rows.filter((r) => r.row.teamId === teamId) }))
+        .map((e) => ({ ...e, rows: e.rows.filter((r) => teamIdSet.has(r.row.teamId)) }))
         .filter((e) => e.rows.length)
         .map((e) => ({ ...e, games: e.rows.length, totals: aggregateStats(e.rows), teamIds: [teamId] }));
     }
@@ -604,10 +633,10 @@ function collectTools(leagueId) {
 
   function scheduleFor(t, s) {
     return games
-      .filter((g) => (g.homeTeamId === t.teamId || g.awayTeamId === t.teamId) && (g.seasonIndex == null || g.seasonIndex === s))
+      .filter((g) => (isTeam(t, g.homeTeamId) || isTeam(t, g.awayTeamId)) && (g.seasonIndex == null || g.seasonIndex === s))
       .sort((a, b) => (a._stage === b._stage ? 0 : a._stage === "preseason" ? -1 : 1) || (a.weekIndex ?? 0) - (b.weekIndex ?? 0))
       .map((g) => {
-        const home = g.homeTeamId === t.teamId;
+        const home = isTeam(t, g.homeTeamId);
         const us = home ? g.homeScore : g.awayScore;
         const them = home ? g.awayScore : g.homeScore;
         const played = (g.homeScore ?? 0) + (g.awayScore ?? 0) > 0;
@@ -718,7 +747,7 @@ function collectTools(leagueId) {
       if (!players.size) return noData();
       const t = findTeam(team);
       if (!t) return needTeams(team);
-      const whole = [...players.values()].filter((p) => !p._freeAgent && p.teamId === t.teamId);
+      const whole = [...players.values()].filter((p) => !p._freeAgent && isTeam(t, p.teamId));
       const counts = {
         total: whole.length,
         active: whole.filter((p) => rosterStatus(p) === "Active").length,
@@ -769,7 +798,7 @@ function collectTools(leagueId) {
         else {
           const t = findTeam(team);
           if (!t) return needTeams(team);
-          list = list.filter((p) => !p._freeAgent && p.teamId === t.teamId);
+          list = list.filter((p) => !p._freeAgent && isTeam(t, p.teamId));
         }
       }
       if (min_ovr != null) list = list.filter((p) => (ovr(p) ?? 0) >= min_ovr);
@@ -880,7 +909,7 @@ function collectTools(leagueId) {
       if (team) {
         const t = findTeam(team);
         if (!t) return needTeams(team);
-        list = list.filter((p) => p.teamId === t.teamId);
+        list = list.filter((p) => isTeam(t, p.teamId));
       }
       if (min_ovr != null) list = list.filter((p) => (ovr(p) ?? 0) >= min_ovr);
       if (min_age != null) list = list.filter((p) => (p.age ?? 0) >= min_age);
@@ -948,7 +977,7 @@ function collectTools(leagueId) {
         seasonIndex: s,
         year: yearFor(s),
         phase,
-        teamsThatSeason: [...new Set(rows.map((r) => r.row.teamId))].map(teamNameById),
+        teamsThatSeason: [...new Set(rows.map((r) => teamNameById(r.row.teamId)))],
         stats: Object.keys(result).length ? result : `No ${phase === "all" ? "" : phase + " "}stats found for this player in that season.`,
         note: "Only weeks that were exported are counted. Rates like passer rating are left out of totals.",
       });
@@ -1066,14 +1095,14 @@ function collectTools(leagueId) {
       const t = findTeam(team);
       if (!t) return needTeams(team);
       const s = toSeason(season);
-      const st = standingsFor(s).find((r) => r.teamId === t.teamId) ?? null;
+      const st = standingsFor(s).find((r) => isTeam(t, r.teamId)) ?? null;
       const keep = [
         "totalWins", "totalLosses", "totalTies", "winPct", "rank", "seed", "playoffStatus", "divisionName", "conferenceName",
         "divWins", "divLosses", "confWins", "confLosses", "ptsFor", "ptsAgainst", "netPts", "ptsForRank", "ptsAgainstRank",
         "offTotalYds", "offTotalYdsRank", "offPassYdsRank", "offRushYdsRank", "defTotalYds", "defTotalYdsRank",
         "defPassYdsRank", "defRushYdsRank", "tODiff", "teamOvr", "weekIndex",
       ];
-      const tRows = teamStats.filter((x) => x.teamId === t.teamId && x.stage === "regular" && x.seasonIndex === s);
+      const tRows = teamStats.filter((x) => isTeam(t, x.teamId) && x.stage === "regular" && x.seasonIndex === s);
       const teamLeaders = {};
       for (const [cat, stat] of [
         ["passing", "passYds"], ["rushing", "rushYds"], ["receiving", "recYds"],
