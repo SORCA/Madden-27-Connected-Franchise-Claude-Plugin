@@ -299,12 +299,43 @@ function collectTools(leagueId) {
   const norm = (s) => String(s ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
   const fullName = (p) => `${p.firstName ?? ""} ${p.lastName ?? ""}`.trim();
   const ovr = (p) => p.playerBestOvr ?? p.overallRating ?? p.playerSchemeOvr ?? null;
+  // Madden renumbers a whole league's teamIds by a constant offset (a re-import, a new
+  // franchise file). Rows written before that carry ids no name is attached to any more,
+  // so name matching alone cannot recover them. Detect the offset instead: the shift that
+  // maps the most orphaned ids onto ids the current teams actually have.
+  const OFFSETS = (() => {
+    const known = [...new Set(teams.map((t) => t.teamId).filter((x) => x != null))];
+    if (known.length < 4) return [];
+    const seen = new Set();
+    for (const g of games) {
+      if (g.homeTeamId != null) seen.add(g.homeTeamId);
+      if (g.awayTeamId != null) seen.add(g.awayTeamId);
+    }
+    for (const r of playerStats) if (r.row?.teamId != null) seen.add(r.row.teamId);
+    for (const r of teamStats) if (r.teamId != null) seen.add(r.teamId);
+    const knownSet = new Set(known);
+    const orphans = new Set([...seen].filter((id) => !knownSet.has(id)));
+    if (!orphans.size) return [];
+    // Score a shift by how many of the CURRENT teams have a counterpart at that shift.
+    // A league-wide renumber scores close to the full roster; coincidences score 1 or 2.
+    const tally = new Map();
+    for (const o of orphans) for (const k of known) {
+      const d = o - k;
+      if (d !== 0) tally.set(d, (tally.get(d) ?? 0) + 1);
+    }
+    let best = null;
+    for (const [d, n] of tally) if (!best || n > best[1]) best = [d, n];
+    // Take one shift only, and only when it explains most of the league.
+    return best && best[1] >= Math.max(4, Math.ceil(known.length * 0.75)) ? [best[0]] : [];
+  })();
+
   // Every teamId this franchise has used, newest first. Madden renumbers ids between
   // exports, so rows written before a renumber carry an id the current roster no longer has.
   function teamIds(t) {
     const ids = new Set();
     if (t?.teamId != null) ids.add(t.teamId);
     for (const id of teamIdAliases.get(teamKeyOf(t)) ?? []) ids.add(id);
+    for (const id of [...ids]) for (const d of OFFSETS) ids.add(id + d);
     return ids;
   }
   const isTeam = (t, id) => id != null && teamIds(t).has(id);
